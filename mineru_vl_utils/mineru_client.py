@@ -20,7 +20,7 @@ from .post_process.table_image_processor import (
 )
 from .structs import BLOCK_TYPES, ContentBlock, ExtractResult, ExtractStr
 from .vlm_client import DEFAULT_SYSTEM_PROMPT, SamplingParams, new_vlm_client
-from .vlm_client.base_client import ImageType, ScoredOutput
+from .vlm_client.base_client import ImageType, ScoredOutput, VlmClient
 from .vlm_client.utils import gather_tasks, get_png_bytes, get_rgb_image
 
 _layout_re = (
@@ -439,6 +439,13 @@ class _PredictResult:
         self.scored = scored
 
 
+def _first_non_empty(*values: str | None) -> str | None:
+    for value in values:
+        if value not in (None, ""):
+            return value
+    return None
+
+
 class MinerUClient:
     def __init__(
         self,
@@ -452,6 +459,8 @@ class MinerUClient:
         ],
         model_name: str | None = None,
         server_url: str | None = None,
+        layout_server_url: str | None = None,
+        recognition_server_url: str | None = None,
         server_headers: dict[str, str] | None = None,
         model=None,  # transformers model
         processor=None,  # transformers processor
@@ -571,10 +580,9 @@ class MinerUClient:
 
                 vllm_async_llm = AsyncLLM.from_engine_args(AsyncEngineArgs(model_path))
 
-        self.client = new_vlm_client(
+        common_client_kwargs = dict(
             backend=backend,
             model_name=model_name,
-            server_url=server_url,
             server_headers=server_headers,
             model=model,
             processor=processor,
@@ -596,6 +604,34 @@ class MinerUClient:
             retry_backoff_factor=retry_backoff_factor,
             skip_model_name_checking=skip_model_name_checking,
         )
+        if backend == "http-client":
+            effective_layout_server_url = _first_non_empty(
+                layout_server_url,
+                server_url,
+                os.getenv("MINERU_VL_LAYOUT_SERVER"),
+            )
+            effective_recognition_server_url = _first_non_empty(
+                recognition_server_url,
+                server_url,
+                os.getenv("MINERU_VL_RECOGNITION_SERVER"),
+            )
+            self.client = new_vlm_client(
+                server_url=effective_recognition_server_url,
+                **common_client_kwargs,
+            )
+            if effective_layout_server_url == effective_recognition_server_url:
+                self.layout_client = self.client
+            else:
+                self.layout_client = new_vlm_client(
+                    server_url=effective_layout_server_url,
+                    **common_client_kwargs,
+                )
+        else:
+            self.client = new_vlm_client(
+                server_url=server_url,
+                **common_client_kwargs,
+            )
+            self.layout_client = self.client
         self.helper = MinerUClientHelper(
             backend=backend,
             prompts=prompts,
@@ -642,11 +678,13 @@ class MinerUClient:
         params: SamplingParams | None,
         priority: int | None,
         scored: bool | None,
+        client: VlmClient | None = None,
     ) -> _PredictResult:
+        client = client or self.client
         if self._resolve_scored(scored):
-            so = self.client.predict_scored(image, prompt, params, priority)
+            so = client.predict_scored(image, prompt, params, priority)
             return _PredictResult(so.text, so)
-        return _PredictResult(self.client.predict(image, prompt, params, priority))
+        return _PredictResult(client.predict(image, prompt, params, priority))
 
     def _batch_predict(
         self,
@@ -655,10 +693,12 @@ class MinerUClient:
         params: Sequence[SamplingParams | None] | SamplingParams | None,
         priority: Sequence[int | None] | int | None,
         scored: bool | None,
+        client: VlmClient | None = None,
     ) -> list[_PredictResult]:
+        client = client or self.client
         if self._resolve_scored(scored):
-            return [_PredictResult(so.text, so) for so in self.client.batch_predict_scored(images, prompts, params, priority)]
-        return [_PredictResult(t) for t in self.client.batch_predict(images, prompts, params, priority)]
+            return [_PredictResult(so.text, so) for so in client.batch_predict_scored(images, prompts, params, priority)]
+        return [_PredictResult(t) for t in client.batch_predict(images, prompts, params, priority)]
 
     async def _aio_predict(
         self,
@@ -668,12 +708,14 @@ class MinerUClient:
         priority: int | None,
         semaphore: asyncio.Semaphore | None,
         scored: bool | None,
+        client: VlmClient | None = None,
     ) -> _PredictResult:
+        client = client or self.client
         async with semaphore if semaphore is not None else nullcontext():
             if self._resolve_scored(scored):
-                so = await self.client.aio_predict_scored(image, prompt, params, priority)
+                so = await client.aio_predict_scored(image, prompt, params, priority)
                 return _PredictResult(so.text, so)
-            return _PredictResult(await self.client.aio_predict(image, prompt, params, priority))
+            return _PredictResult(await client.aio_predict(image, prompt, params, priority))
 
     async def _aio_batch_predict(
         self,
@@ -685,9 +727,11 @@ class MinerUClient:
         scored: bool | None,
         use_tqdm: bool = False,
         tqdm_desc: str | None = None,
+        client: VlmClient | None = None,
     ) -> list[_PredictResult]:
+        client = client or self.client
         if self._resolve_scored(scored):
-            scored_outputs = await self.client.aio_batch_predict_scored(
+            scored_outputs = await client.aio_batch_predict_scored(
                 images,
                 prompts,
                 params,
@@ -698,7 +742,7 @@ class MinerUClient:
             )
             return [_PredictResult(so.text, so) for so in scored_outputs]
         else:
-            texts = await self.client.aio_batch_predict(
+            texts = await client.aio_batch_predict(
                 images,
                 prompts,
                 params,
@@ -737,7 +781,7 @@ class MinerUClient:
         layout_image = self.helper.prepare_for_layout(image)
         prompt = self.prompts.get("[layout]") or self.prompts["[default]"]
         params = self.sampling_params.get("[layout]") or self.sampling_params.get("[default]")
-        output = self._predict(layout_image, prompt, params, priority, scored)
+        output = self._predict(layout_image, prompt, params, priority, scored, client=self.layout_client)
         blocks = self.helper.parse_layout_output(output.text)
         return ExtractResult(blocks, output.scored)
 
@@ -752,7 +796,7 @@ class MinerUClient:
         layout_images = self.helper.batch_prepare_for_layout(self.executor, images)
         prompt = self.prompts.get("[layout]") or self.prompts["[default]"]
         params = self.sampling_params.get("[layout]") or self.sampling_params.get("[default]")
-        outputs = self._batch_predict(layout_images, prompt, params, priority, scored)
+        outputs = self._batch_predict(layout_images, prompt, params, priority, scored, client=self.layout_client)
         blocks_list = self.helper.batch_parse_layout_output(self.executor, [output.text for output in outputs])
         return [ExtractResult(blocks, output.scored) for blocks, output in zip(blocks_list, outputs)]
 
@@ -766,7 +810,7 @@ class MinerUClient:
         layout_image = await self.helper.aio_prepare_for_layout(self.executor, image)
         prompt = self.prompts.get("[layout]") or self.prompts["[default]"]
         params = self.sampling_params.get("[layout]") or self.sampling_params.get("[default]")
-        output = await self._aio_predict(layout_image, prompt, params, priority, semaphore, scored)
+        output = await self._aio_predict(layout_image, prompt, params, priority, semaphore, scored, client=self.layout_client)
         blocks = await self.helper.aio_parse_layout_output(self.executor, output.text)
         return ExtractResult(blocks, output.scored)
 
@@ -796,6 +840,7 @@ class MinerUClient:
             scored,
             use_tqdm=self.use_tqdm,
             tqdm_desc="Layout Detection",
+            client=self.layout_client,
         )
         blocks_list = await gather_tasks(
             tasks=[self.helper.aio_parse_layout_output(self.executor, output.text) for output in outputs],
