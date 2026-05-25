@@ -2,6 +2,7 @@ import asyncio
 import math
 import os
 import re
+import time
 from concurrent.futures import Executor
 from contextlib import nullcontext
 from typing import Any, Callable, Literal, Sequence, TypeVar
@@ -9,6 +10,7 @@ from typing import Any, Callable, Literal, Sequence, TypeVar
 from loguru import logger
 from PIL import Image
 
+from .dissection import DissectionRecorder
 from .post_process import post_process
 from .post_process.table_image_processor import (
     TABLE_IMAGE_TOKEN_MAP_KEY,
@@ -793,6 +795,120 @@ class MinerUClient:
             return [_PredictResult(t) for t in texts]
 
     @staticmethod
+    def _client_endpoint(client: VlmClient | None) -> str | None:
+        if client is None:
+            return None
+        return getattr(client, "chat_url", None) or getattr(client, "server_url", None)
+
+    @staticmethod
+    def _client_model_name(client: VlmClient | None) -> str | None:
+        if client is None:
+            return None
+        return getattr(client, "model_name", None)
+
+    def _record_dissection_layout(
+        self,
+        recorder: DissectionRecorder | None,
+        page_idx: int,
+        image: Image.Image,
+        layout_result: ExtractResult,
+    ) -> dict[int, str]:
+        if recorder is None:
+            return {}
+        bbox_ids = recorder.record_layout(page_idx, layout_result, image_size=image.size)
+        recorder.save_layout_crops(page_idx, image, layout_result, bbox_ids)
+        return bbox_ids
+
+    def _record_dissection_prepared_crops(
+        self,
+        recorder: DissectionRecorder | None,
+        bbox_ids: dict[int, str],
+        block_images: Sequence[Image.Image | bytes],
+        indices: Sequence[int],
+    ) -> None:
+        if recorder is None:
+            return
+        requested = set(indices)
+        for block_image, idx in zip(block_images, indices):
+            bbox_id = bbox_ids.get(idx)
+            if bbox_id:
+                recorder.save_prepared_crop(bbox_id, block_image)
+        for idx, bbox_id in bbox_ids.items():
+            if idx not in requested:
+                recorder.record_skipped(bbox_id, "not_sent_to_recognition")
+
+    def _predict_with_dissection(
+        self,
+        image: ImageType,
+        prompt: str,
+        params: SamplingParams | None,
+        priority: int | None,
+        scored: bool | None,
+        bbox_id: str,
+        recorder: DissectionRecorder,
+    ) -> _PredictResult | None:
+        start = time.monotonic()
+        recorder.record_recognition_requested(
+            bbox_id,
+            prompt=prompt,
+            endpoint=self._client_endpoint(self.client),
+            model_name=self._client_model_name(self.client),
+        )
+        try:
+            output = self._predict(image, prompt, params, priority, scored)
+        except Exception as exc:
+            recorder.record_failed(
+                bbox_id,
+                stage="recognition",
+                error=exc,
+                retry_count=getattr(self.client, "max_retries", None),
+                retry_backoff_factor=getattr(self.client, "retry_backoff_factor", None),
+            )
+            return None
+        recorder.record_recognized(
+            bbox_id,
+            output.text,
+            duration_seconds=time.monotonic() - start,
+        )
+        return output
+
+    async def _aio_predict_with_dissection(
+        self,
+        image: ImageType,
+        prompt: str,
+        params: SamplingParams | None,
+        priority: int | None,
+        semaphore: asyncio.Semaphore | None,
+        scored: bool | None,
+        bbox_id: str,
+        recorder: DissectionRecorder,
+    ) -> _PredictResult | None:
+        start = time.monotonic()
+        recorder.record_recognition_requested(
+            bbox_id,
+            prompt=prompt,
+            endpoint=self._client_endpoint(self.client),
+            model_name=self._client_model_name(self.client),
+        )
+        try:
+            output = await self._aio_predict(image, prompt, params, priority, semaphore, scored)
+        except Exception as exc:
+            recorder.record_failed(
+                bbox_id,
+                stage="recognition",
+                error=exc,
+                retry_count=getattr(self.client, "max_retries", None),
+                retry_backoff_factor=getattr(self.client, "retry_backoff_factor", None),
+            )
+            return None
+        recorder.record_recognized(
+            bbox_id,
+            output.text,
+            duration_seconds=time.monotonic() - start,
+        )
+        return output
+
+    @staticmethod
     def _flatten_prepared_inputs(
         prepared_inputs: list[tuple[list[Image.Image | bytes], list[str], list[SamplingParams | None], list[int]]],
     ) -> tuple[list[Image.Image | bytes], list[str], list[SamplingParams | None], list[tuple[int, int]]]:
@@ -1001,18 +1117,50 @@ class MinerUClient:
         not_extract_list: list[str] | None = None,
         scored: bool | None = None,
         image_analysis: bool | None = None,
+        dissection_recorder: DissectionRecorder | None = None,
+        page_idx: int = 0,
     ) -> ExtractResult:
-        layout_result = self.layout_detect(image, priority, scored)
+        try:
+            layout_result = self.layout_detect(image, priority, scored)
+        except Exception as exc:
+            if dissection_recorder is not None:
+                dissection_recorder.record_failed(
+                    DissectionRecorder.bbox_id(page_idx, 0),
+                    stage="layout",
+                    error=exc,
+                )
+            raise
+        bbox_ids = self._record_dissection_layout(dissection_recorder, page_idx, image, layout_result)
         block_images, prompts, params, indices = self.helper.prepare_for_extract(
             image,
             layout_result,
             not_extract_list,
             image_analysis,
         )
-        outputs = self._batch_predict(block_images, prompts, params, priority, scored)
-        for idx, output in zip(indices, outputs):
-            layout_result[idx].content = output.text
-            layout_result[idx].scored = output.scored
+        self._record_dissection_prepared_crops(dissection_recorder, bbox_ids, block_images, indices)
+        if dissection_recorder is None:
+            outputs = self._batch_predict(block_images, prompts, params, priority, scored)
+            for idx, output in zip(indices, outputs):
+                layout_result[idx].content = output.text
+                layout_result[idx].scored = output.scored
+        else:
+            for block_image, prompt, param, idx in zip(block_images, prompts, params, indices):
+                bbox_id = bbox_ids.get(idx)
+                if not bbox_id:
+                    continue
+                output = self._predict_with_dissection(
+                    block_image,
+                    prompt,
+                    param,
+                    priority,
+                    scored,
+                    bbox_id,
+                    dissection_recorder,
+                )
+                if output is None:
+                    continue
+                layout_result[idx].content = output.text
+                layout_result[idx].scored = output.scored
         return ExtractResult(self.helper.post_process(layout_result), layout_result.layout_scored)
 
     async def aio_two_step_extract(
@@ -1023,9 +1171,21 @@ class MinerUClient:
         not_extract_list: list[str] | None = None,
         scored: bool | None = None,
         image_analysis: bool | None = None,
+        dissection_recorder: DissectionRecorder | None = None,
+        page_idx: int = 0,
     ) -> ExtractResult:
         semaphore = semaphore or asyncio.Semaphore(self.max_concurrency)
-        layout_result = await self.aio_layout_detect(image, priority, semaphore, scored)
+        try:
+            layout_result = await self.aio_layout_detect(image, priority, semaphore, scored)
+        except Exception as exc:
+            if dissection_recorder is not None:
+                dissection_recorder.record_failed(
+                    DissectionRecorder.bbox_id(page_idx, 0),
+                    stage="layout",
+                    error=exc,
+                )
+            raise
+        bbox_ids = self._record_dissection_layout(dissection_recorder, page_idx, image, layout_result)
         block_images, prompts, params, indices = await self.helper.aio_prepare_for_extract(
             self.executor,
             image,
@@ -1033,10 +1193,38 @@ class MinerUClient:
             not_extract_list,
             image_analysis,
         )
-        outputs = await self._aio_batch_predict(block_images, prompts, params, priority, semaphore, scored)
-        for idx, output in zip(indices, outputs):
-            layout_result[idx].content = output.text
-            layout_result[idx].scored = output.scored
+        self._record_dissection_prepared_crops(dissection_recorder, bbox_ids, block_images, indices)
+        if dissection_recorder is None:
+            outputs = await self._aio_batch_predict(block_images, prompts, params, priority, semaphore, scored)
+            for idx, output in zip(indices, outputs):
+                layout_result[idx].content = output.text
+                layout_result[idx].scored = output.scored
+        else:
+            tasks = []
+            task_indices = []
+            for block_image, prompt, param, idx in zip(block_images, prompts, params, indices):
+                bbox_id = bbox_ids.get(idx)
+                if not bbox_id:
+                    continue
+                tasks.append(
+                    self._aio_predict_with_dissection(
+                        block_image,
+                        prompt,
+                        param,
+                        priority,
+                        semaphore,
+                        scored,
+                        bbox_id,
+                        dissection_recorder,
+                    )
+                )
+                task_indices.append(idx)
+            outputs = await gather_tasks(tasks=tasks, use_tqdm=False)
+            for idx, output in zip(task_indices, outputs):
+                if output is None:
+                    continue
+                layout_result[idx].content = output.text
+                layout_result[idx].scored = output.scored
         processed = await self.helper.aio_post_process(self.executor, layout_result)
         return ExtractResult(processed, layout_result.layout_scored)
 
@@ -1047,6 +1235,8 @@ class MinerUClient:
         not_extract_list: list[str] | None = None,
         scored: bool | None = None,
         image_analysis: bool | None = None,
+        dissection_recorder: DissectionRecorder | None = None,
+        page_start_index: int = 0,
     ) -> list[ExtractResult]:
         try:
             loop = asyncio.get_running_loop()
@@ -1059,6 +1249,8 @@ class MinerUClient:
             not_extract_list,
             scored=scored,
             image_analysis=image_analysis,
+            dissection_recorder=dissection_recorder,
+            page_start_index=page_start_index,
         )
 
         if loop is not None:
@@ -1074,6 +1266,8 @@ class MinerUClient:
         semaphore: asyncio.Semaphore | None = None,
         scored: bool | None = None,
         image_analysis: bool | None = None,
+        dissection_recorder: DissectionRecorder | None = None,
+        page_start_index: int = 0,
     ) -> list[ExtractResult]:
         if priority is None and self.incremental_priority:
             priority = list(range(len(images)))
@@ -1089,8 +1283,10 @@ class MinerUClient:
                     not_extract_list=not_extract_list,
                     scored=scored,
                     image_analysis=image_analysis,
+                    dissection_recorder=dissection_recorder,
+                    page_idx=page_start_index + img_idx,
                 )
-                for image, page_priority in zip(images, priority)
+                for img_idx, (image, page_priority) in enumerate(zip(images, priority))
             ],
             use_tqdm=self.use_tqdm,
             tqdm_desc="Two Step Extraction",
@@ -1219,6 +1415,8 @@ class MinerUClient:
         not_extract_list: list[str] | None = None,
         scored: bool | None = None,
         image_analysis: bool | None = None,
+        dissection_recorder: DissectionRecorder | None = None,
+        page_start_index: int = 0,
     ) -> list[ExtractResult]:
         if self.batching_mode == "concurrent":
             return self.concurrent_two_step_extract(
@@ -1227,6 +1425,8 @@ class MinerUClient:
                 not_extract_list,
                 scored,
                 image_analysis,
+                dissection_recorder,
+                page_start_index,
             )
         else:  # self.batching_mode == "stepping"
             return self.stepping_two_step_extract(
@@ -1245,6 +1445,8 @@ class MinerUClient:
         semaphore: asyncio.Semaphore | None = None,
         scored: bool | None = None,
         image_analysis: bool | None = None,
+        dissection_recorder: DissectionRecorder | None = None,
+        page_start_index: int = 0,
     ) -> list[ExtractResult]:
         semaphore = semaphore or asyncio.Semaphore(self.max_concurrency)
         if self.batching_mode == "concurrent":
@@ -1255,6 +1457,8 @@ class MinerUClient:
                 semaphore,
                 scored,
                 image_analysis,
+                dissection_recorder,
+                page_start_index,
             )
         else:  # self.batching_mode == "stepping"
             return await self.aio_stepping_two_step_extract(

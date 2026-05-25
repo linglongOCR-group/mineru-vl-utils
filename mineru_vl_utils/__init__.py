@@ -7,6 +7,7 @@ __lazy_attrs__ = {
     "MinerUClient": (".mineru_client", "MinerUClient"),
     "MinerUSamplingParams": (".mineru_client", "MinerUSamplingParams"),
     "MinerULogitsProcessor": (".logits_processor.vllm_v1_no_repeat_ngram", "VllmV1NoRepeatNGramLogitsProcessor"),
+    "DissectionRecorder": (".dissection", "DissectionRecorder"),
 }
 
 if TYPE_CHECKING:
@@ -15,6 +16,7 @@ if TYPE_CHECKING:
         VllmV1NoRepeatNGramLogitsProcessor as MinerULogitsProcessor,
     )
     from .mineru_client import MinerUClient, MinerUSamplingParams
+    from .dissection import DissectionRecorder
 
 
 def __getattr__(name: str):
@@ -29,5 +31,6 @@ __all__ = [
     "MinerUClient",
     "MinerUSamplingParams",
     "MinerULogitsProcessor",
+    "DissectionRecorder",
     "__version__",
 ]

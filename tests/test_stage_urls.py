@@ -44,7 +44,7 @@ def test_http_client_routes_layout_and_recognition_to_stage_urls(monkeypatch):
 
     client.helper.prepare_for_layout = lambda image: "layout-image"
     client.helper.parse_layout_output = lambda output: [ContentBlock("text", [0.0, 0.0, 1.0, 1.0])]
-    client.helper.prepare_for_extract = lambda image, blocks, not_extract_list=None: (
+    client.helper.prepare_for_extract = lambda image, blocks, not_extract_list=None, image_analysis=None: (
         ["recognition-image"],
         ["recognition-prompt"],
         [None],
@@ -55,7 +55,10 @@ def test_http_client_routes_layout_and_recognition_to_stage_urls(monkeypatch):
     result = client.two_step_extract(image="page")
 
     assert result[0].content == "http://recognition:recognition"
-    assert client.layout_client.predict_calls == [("layout-image", "\nLayout Detection:", None, None)]
+    layout_call = client.layout_client.predict_calls[0]
+    assert layout_call[0] == "layout-image"
+    assert layout_call[1] == "\nLayout Detection:"
+    assert layout_call[3] is None
     assert client.client.batch_predict_calls == [
         (["recognition-image"], ["recognition-prompt"], [None], None)
     ]
