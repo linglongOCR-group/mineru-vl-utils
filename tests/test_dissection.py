@@ -55,6 +55,14 @@ def test_dissection_recorder_writes_layout_crops_recognition_and_manifest(tmp_pa
     assert failed["status"] == "failed"
     assert failed["exception_type"] == "RuntimeError"
     assert failed["http_status_code"] == 502
+    assert "request_failed" in failed
+    assert failed["request_end"] == failed["request_failed"]
+    assert failed["duration_seconds"] >= 0
+    assert failed["error_info"] == {
+        "stage": "recognition",
+        "exception_type": "RuntimeError",
+        "http_status_code": 502,
+    }
 
     errors = (tmp_path / "dissection" / "errors.jsonl").read_text(encoding="utf-8").splitlines()
     assert len(errors) == 1
@@ -93,6 +101,15 @@ def test_dissection_recorder_writes_partial_recognition(tmp_path):
     assert partial["partial_content"] == "hello par"
     assert partial["exception_type"] == "TimeoutError"
     assert partial["retry_count"] == 3
+    assert "request_failed" in partial
+    assert partial["request_end"] == partial["request_failed"]
+    assert partial["duration_seconds"] >= 0
+    assert partial["error_info"] == {
+        "stage": "recognition",
+        "exception_type": "TimeoutError",
+        "http_status_code": None,
+        "retry_count": 3,
+    }
     assert partial["transitions"] == ["detected", "recognition_requested", "partial"]
 
     errors = (tmp_path / "dissection" / "errors.jsonl").read_text(encoding="utf-8").splitlines()
@@ -103,3 +120,26 @@ def test_dissection_recorder_writes_partial_recognition(tmp_path):
 
     manifest = _read_json(tmp_path / "dissection" / "manifest.json")
     assert manifest["status_counts"] == {"partial": 1}
+
+
+def test_dissection_recorder_writes_pipeline_timing(tmp_path):
+    recorder = DissectionRecorder(tmp_path / "dissection", document_stem="doc")
+
+    recorder.record_pipeline_started()
+    recorder.record_stage_started("layout_detection")
+    recorder.record_stage_finished("layout_detection", "completed")
+    recorder.record_stage_started("crop_generation")
+    recorder.record_stage_finished("crop_generation", "completed")
+    recorder.record_pipeline_finished("completed")
+    recorder.finalize()
+
+    manifest = _read_json(tmp_path / "dissection" / "manifest.json")
+    pipeline = manifest["pipeline"]
+    assert pipeline["status"] == "completed"
+    assert "started_at" in pipeline
+    assert "ended_at" in pipeline
+    assert pipeline["duration_seconds"] >= 0
+    stages = {stage["name"]: stage for stage in pipeline["stages"]}
+    assert stages["layout_detection"]["status"] == "completed"
+    assert stages["crop_generation"]["status"] == "completed"
+    assert stages["layout_detection"]["duration_seconds"] >= 0

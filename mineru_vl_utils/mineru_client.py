@@ -1226,24 +1226,41 @@ class MinerUClient:
         dissection_stream: bool = False,
         page_idx: int = 0,
     ) -> ExtractResult:
+        if dissection_recorder is not None:
+            dissection_recorder.record_pipeline_started()
+            dissection_recorder.record_stage_started("layout_detection")
         try:
             layout_result = self.layout_detect(image, priority, scored)
         except Exception as exc:
             if dissection_recorder is not None:
+                dissection_recorder.record_stage_finished("layout_detection", "failed", exc)
+                dissection_recorder.record_pipeline_finished("failed", exc)
                 dissection_recorder.record_failed(
                     DissectionRecorder.bbox_id(page_idx, 0),
                     stage="layout",
                     error=exc,
                 )
             raise
-        bbox_ids = self._record_dissection_layout(dissection_recorder, page_idx, image, layout_result)
-        block_images, prompts, params, indices = self.helper.prepare_for_extract(
-            image,
-            layout_result,
-            not_extract_list,
-            image_analysis,
-        )
-        self._record_dissection_prepared_crops(dissection_recorder, bbox_ids, block_images, indices)
+        if dissection_recorder is not None:
+            dissection_recorder.record_stage_finished("layout_detection", "completed")
+            dissection_recorder.record_stage_started("crop_generation")
+        try:
+            bbox_ids = self._record_dissection_layout(dissection_recorder, page_idx, image, layout_result)
+            block_images, prompts, params, indices = self.helper.prepare_for_extract(
+                image,
+                layout_result,
+                not_extract_list,
+                image_analysis,
+            )
+            self._record_dissection_prepared_crops(dissection_recorder, bbox_ids, block_images, indices)
+        except Exception as exc:
+            if dissection_recorder is not None:
+                dissection_recorder.record_stage_finished("crop_generation", "failed", exc)
+                dissection_recorder.record_pipeline_finished("failed", exc)
+            raise
+        if dissection_recorder is not None:
+            dissection_recorder.record_stage_finished("crop_generation", "completed")
+            dissection_recorder.record_stage_started("crop_recognition")
         if dissection_recorder is None:
             outputs = self._batch_predict(block_images, prompts, params, priority, scored)
             for idx, output in zip(indices, outputs):
@@ -1278,7 +1295,20 @@ class MinerUClient:
                     continue
                 layout_result[idx].content = output.text
                 layout_result[idx].scored = output.scored
-        return ExtractResult(self.helper.post_process(layout_result), layout_result.layout_scored)
+        if dissection_recorder is not None:
+            dissection_recorder.record_stage_finished("crop_recognition", "completed")
+            dissection_recorder.record_stage_started("post_processing")
+        try:
+            processed = self.helper.post_process(layout_result)
+        except Exception as exc:
+            if dissection_recorder is not None:
+                dissection_recorder.record_stage_finished("post_processing", "failed", exc)
+                dissection_recorder.record_pipeline_finished("failed", exc)
+            raise
+        if dissection_recorder is not None:
+            dissection_recorder.record_stage_finished("post_processing", "completed")
+            dissection_recorder.record_pipeline_finished("completed")
+        return ExtractResult(processed, layout_result.layout_scored)
 
     async def aio_two_step_extract(
         self,
@@ -1293,25 +1323,42 @@ class MinerUClient:
         page_idx: int = 0,
     ) -> ExtractResult:
         semaphore = semaphore or asyncio.Semaphore(self.max_concurrency)
+        if dissection_recorder is not None:
+            dissection_recorder.record_pipeline_started()
+            dissection_recorder.record_stage_started("layout_detection")
         try:
             layout_result = await self.aio_layout_detect(image, priority, semaphore, scored)
         except Exception as exc:
             if dissection_recorder is not None:
+                dissection_recorder.record_stage_finished("layout_detection", "failed", exc)
+                dissection_recorder.record_pipeline_finished("failed", exc)
                 dissection_recorder.record_failed(
                     DissectionRecorder.bbox_id(page_idx, 0),
                     stage="layout",
                     error=exc,
                 )
             raise
-        bbox_ids = self._record_dissection_layout(dissection_recorder, page_idx, image, layout_result)
-        block_images, prompts, params, indices = await self.helper.aio_prepare_for_extract(
-            self.executor,
-            image,
-            layout_result,
-            not_extract_list,
-            image_analysis,
-        )
-        self._record_dissection_prepared_crops(dissection_recorder, bbox_ids, block_images, indices)
+        if dissection_recorder is not None:
+            dissection_recorder.record_stage_finished("layout_detection", "completed")
+            dissection_recorder.record_stage_started("crop_generation")
+        try:
+            bbox_ids = self._record_dissection_layout(dissection_recorder, page_idx, image, layout_result)
+            block_images, prompts, params, indices = await self.helper.aio_prepare_for_extract(
+                self.executor,
+                image,
+                layout_result,
+                not_extract_list,
+                image_analysis,
+            )
+            self._record_dissection_prepared_crops(dissection_recorder, bbox_ids, block_images, indices)
+        except Exception as exc:
+            if dissection_recorder is not None:
+                dissection_recorder.record_stage_finished("crop_generation", "failed", exc)
+                dissection_recorder.record_pipeline_finished("failed", exc)
+            raise
+        if dissection_recorder is not None:
+            dissection_recorder.record_stage_finished("crop_generation", "completed")
+            dissection_recorder.record_stage_started("crop_recognition")
         if dissection_recorder is None:
             outputs = await self._aio_batch_predict(block_images, prompts, params, priority, semaphore, scored)
             for idx, output in zip(indices, outputs):
@@ -1344,7 +1391,19 @@ class MinerUClient:
                     continue
                 layout_result[idx].content = output.text
                 layout_result[idx].scored = output.scored
-        processed = await self.helper.aio_post_process(self.executor, layout_result)
+        if dissection_recorder is not None:
+            dissection_recorder.record_stage_finished("crop_recognition", "completed")
+            dissection_recorder.record_stage_started("post_processing")
+        try:
+            processed = await self.helper.aio_post_process(self.executor, layout_result)
+        except Exception as exc:
+            if dissection_recorder is not None:
+                dissection_recorder.record_stage_finished("post_processing", "failed", exc)
+                dissection_recorder.record_pipeline_finished("failed", exc)
+            raise
+        if dissection_recorder is not None:
+            dissection_recorder.record_stage_finished("post_processing", "completed")
+            dissection_recorder.record_pipeline_finished("completed")
         return ExtractResult(processed, layout_result.layout_scored)
 
     def concurrent_two_step_extract(

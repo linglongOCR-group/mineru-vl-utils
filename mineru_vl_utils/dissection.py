@@ -46,6 +46,9 @@ class DissectionRecorder:
         self.pages: dict[int, dict[str, Any]] = {}
         self.records: dict[str, dict[str, Any]] = {}
         self._request_starts: dict[str, float] = {}
+        self.pipeline: dict[str, Any] | None = None
+        self._pipeline_start: float | None = None
+        self._stage_starts: dict[str, float] = {}
         self._ensure_dirs()
 
     def _ensure_dirs(self) -> None:
@@ -223,6 +226,97 @@ class DissectionRecorder:
         self._write_recognition_record(bbox_id, record)
         self._flush_manifest()
 
+    def record_pipeline_started(self) -> None:
+        if self.pipeline is not None:
+            return
+        self._pipeline_start = time.monotonic()
+        self.pipeline = {
+            "started_at": _utc_timestamp(),
+            "status": "running",
+            "stages": [],
+        }
+        self._flush_manifest()
+
+    def _stage_record(self, name: str) -> dict[str, Any]:
+        self.record_pipeline_started()
+        assert self.pipeline is not None
+        for stage in self.pipeline["stages"]:
+            if stage["name"] == name:
+                return stage
+        stage = {
+            "name": name,
+            "status": "pending",
+        }
+        self.pipeline["stages"].append(stage)
+        return stage
+
+    def record_stage_started(self, name: str) -> None:
+        stage = self._stage_record(name)
+        if stage.get("status") == "running":
+            return
+        self._stage_starts[name] = time.monotonic()
+        stage.pop("ended_at", None)
+        stage.pop("duration_seconds", None)
+        stage.pop("error_info", None)
+        stage.update(
+            {
+                "started_at": _utc_timestamp(),
+                "status": "running",
+            }
+        )
+        if self.pipeline is not None:
+            self.pipeline["status"] = "running"
+        self._flush_manifest()
+
+    def record_stage_finished(
+        self,
+        name: str,
+        status: str = "completed",
+        error: BaseException | None = None,
+    ) -> None:
+        stage = self._stage_record(name)
+        now = time.monotonic()
+        start = self._stage_starts.pop(name, None)
+        if start is None:
+            start = now
+            stage.setdefault("started_at", _utc_timestamp())
+        stage.update(
+            {
+                "ended_at": _utc_timestamp(),
+                "duration_seconds": round(now - start, 6),
+                "status": status,
+            }
+        )
+        if error is not None:
+            stage["error_info"] = {
+                "exception_type": type(error).__name__,
+                "message": str(error),
+            }
+        self._flush_manifest()
+
+    def record_pipeline_finished(
+        self,
+        status: str,
+        error: BaseException | None = None,
+    ) -> None:
+        self.record_pipeline_started()
+        assert self.pipeline is not None
+        now = time.monotonic()
+        start = self._pipeline_start if self._pipeline_start is not None else now
+        self.pipeline.update(
+            {
+                "ended_at": _utc_timestamp(),
+                "duration_seconds": round(now - start, 6),
+                "status": status,
+            }
+        )
+        if error is not None:
+            self.pipeline["error_info"] = {
+                "exception_type": type(error).__name__,
+                "message": str(error),
+            }
+        self._flush_manifest()
+
     def record_partial(
         self,
         bbox_id: str,
@@ -280,10 +374,14 @@ class DissectionRecorder:
             bbox_id,
             {"bbox_id": bbox_id, "transitions": []},
         )
-        record["request_end"] = _utc_timestamp()
+        failed_at = _utc_timestamp()
+        record["request_failed"] = failed_at
+        record["request_end"] = failed_at
         start = self._request_starts.pop(bbox_id, None)
         if start is not None:
             record["duration_seconds"] = round(time.monotonic() - start, 6)
+        elif stage == "recognition":
+            record["duration_seconds"] = 0.0
         if retry_count is not None:
             record["retry_count"] = retry_count
         if retry_backoff_factor is not None:
@@ -301,6 +399,16 @@ class DissectionRecorder:
             "http_status_code": status_code,
             "traceback": "".join(traceback.format_exception_only(type(error), error)).strip(),
         }
+        error_info = {
+            "stage": stage,
+            "exception_type": type(error).__name__,
+            "http_status_code": status_code,
+        }
+        if retry_count is not None:
+            error_info["retry_count"] = retry_count
+        if retry_backoff_factor is not None:
+            error_info["retry_backoff_factor"] = retry_backoff_factor
+        error_payload["error_info"] = error_info
         if extra_payload:
             error_payload.update(extra_payload)
         record.update(error_payload)
@@ -329,6 +437,7 @@ class DissectionRecorder:
                 "updated_at": _utc_timestamp(),
                 "total_blocks": len(records),
                 "status_counts": status_counts,
+                **({"pipeline": self.pipeline} if self.pipeline is not None else {}),
                 "records": records,
             },
         )
