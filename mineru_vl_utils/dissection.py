@@ -223,6 +223,26 @@ class DissectionRecorder:
         self._write_recognition_record(bbox_id, record)
         self._flush_manifest()
 
+    def record_partial(
+        self,
+        bbox_id: str,
+        partial_content: str,
+        error: BaseException,
+        http_status_code: int | None = None,
+        retry_count: int | None = None,
+        retry_backoff_factor: float | None = None,
+    ) -> None:
+        self._record_error_status(
+            bbox_id,
+            status="partial",
+            stage="recognition",
+            error=error,
+            http_status_code=http_status_code,
+            retry_count=retry_count,
+            retry_backoff_factor=retry_backoff_factor,
+            extra_payload={"partial_content": partial_content},
+        )
+
     def record_failed(
         self,
         bbox_id: str,
@@ -233,6 +253,29 @@ class DissectionRecorder:
         retry_count: int | None = None,
         retry_backoff_factor: float | None = None,
     ) -> None:
+        self._record_error_status(
+            bbox_id,
+            status="failed",
+            stage=stage,
+            error=error,
+            crop_path=crop_path,
+            http_status_code=http_status_code,
+            retry_count=retry_count,
+            retry_backoff_factor=retry_backoff_factor,
+        )
+
+    def _record_error_status(
+        self,
+        bbox_id: str,
+        status: str,
+        stage: str,
+        error: BaseException,
+        crop_path: str | None = None,
+        http_status_code: int | None = None,
+        retry_count: int | None = None,
+        retry_backoff_factor: float | None = None,
+        extra_payload: dict[str, Any] | None = None,
+    ) -> None:
         record = self.records.setdefault(
             bbox_id,
             {"bbox_id": bbox_id, "transitions": []},
@@ -241,12 +284,12 @@ class DissectionRecorder:
         start = self._request_starts.pop(bbox_id, None)
         if start is not None:
             record["duration_seconds"] = round(time.monotonic() - start, 6)
-        if crop_path:
-            record["crop_path"] = crop_path
         if retry_count is not None:
             record["retry_count"] = retry_count
         if retry_backoff_factor is not None:
             record["retry_backoff_factor"] = retry_backoff_factor
+        if crop_path is not None:
+            record["crop_path"] = crop_path
         status_code = http_status_code if http_status_code is not None else _safe_status_code(error)
         error_payload = {
             "bbox_id": bbox_id,
@@ -258,8 +301,10 @@ class DissectionRecorder:
             "http_status_code": status_code,
             "traceback": "".join(traceback.format_exception_only(type(error), error)).strip(),
         }
+        if extra_payload:
+            error_payload.update(extra_payload)
         record.update(error_payload)
-        self._record_transition(record, "failed")
+        self._record_transition(record, status)
         self._write_recognition_record(bbox_id, record)
         with self.errors_path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(error_payload, ensure_ascii=False, default=_json_default) + "\n")

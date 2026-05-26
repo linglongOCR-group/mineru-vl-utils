@@ -340,6 +340,26 @@ class HttpVlmClient(VlmClient):
             content = content[: -len(end_token)]
         return content or ""
 
+    def _validate_finish_reason(self, finish_reason: str | None) -> None:
+        if finish_reason is None:
+            return
+        if finish_reason == "length":
+            if not self.allow_truncated_content:
+                raise RequestError("The response was truncated due to length limit.")
+            logger.warning("The response was truncated due to length limit.")
+        elif finish_reason != "stop":
+            raise RequestError(f"Unexpected finish reason: {finish_reason}")
+
+    def _stream_delta_content(self, response_data: dict) -> str | None:
+        choices = response_data.get("choices") or []
+        choice = choices[0] if choices else {}
+        self._validate_finish_reason(choice.get("finish_reason"))
+        delta = choice.get("delta") or {}
+        content = delta.get("content")
+        if content is not None and not isinstance(content, str):
+            raise ServerError(f"Unexpected streamed content type: {type(content)}.")
+        return content
+
     def predict(
         self,
         image: ImageType,
@@ -423,6 +443,9 @@ class HttpVlmClient(VlmClient):
             logger.debug("Request body: {}", request_text)
 
         with self._client.stream("POST", self.chat_url, json=request_body) as response:
+            if response.status_code != 200:
+                body = response.read().decode("utf-8", errors="replace")
+                raise ServerError(f"Unexpected status code: [{response.status_code}], response body: {body}")
             for chunk in response.iter_lines():
                 chunk = chunk.strip()
                 if not chunk.startswith("data:"):
@@ -431,11 +454,9 @@ class HttpVlmClient(VlmClient):
                 if chunk == "[DONE]":
                     break
                 response_data = json.loads(chunk)
-                choices = response_data.get("choices") or []
-                choice = choices[0] if choices else {}
-                delta = choice.get("delta") or {}
-                if "content" in delta:
-                    yield delta["content"]
+                content = self._stream_delta_content(response_data)
+                if content is not None:
+                    yield content
 
     def stream_test(
         self,
@@ -490,6 +511,48 @@ class HttpVlmClient(VlmClient):
             logger.debug("Response body: {}", response.text)
 
         return self.get_response_content(response_data)
+
+    async def async_stream_predict(
+        self,
+        image: ImageType,
+        prompt: str = "",
+        sampling_params: SamplingParams | None = None,
+        priority: int | None = None,
+    ) -> AsyncIterable[str]:
+        image, image_format = await aio_image_to_bytes_list_and_format(image)
+
+        request_body = self.build_request_body(
+            system_prompt=self.system_prompt,
+            image=image,
+            prompt=prompt,
+            sampling_params=sampling_params,
+            image_format=image_format,
+            priority=priority,
+        )
+        request_body["stream"] = True
+
+        if self.debug:
+            request_text = json.dumps(request_body, ensure_ascii=False)
+            if len(request_text) > 4096:
+                request_text = request_text[:2048] + "...(truncated)..." + request_text[-2048:]
+            logger.debug("Request body: {}", request_text)
+
+        client = await self._aio_client()
+        async with client.stream("POST", self.chat_url, json=request_body) as response:
+            if response.status_code != 200:
+                body = (await response.aread()).decode("utf-8", errors="replace")
+                raise ServerError(f"Unexpected status code: [{response.status_code}], response body: {body}")
+            async for chunk in response.aiter_lines():
+                chunk = chunk.strip()
+                if not chunk.startswith("data:"):
+                    continue
+                chunk = chunk[5:].lstrip()
+                if chunk == "[DONE]":
+                    break
+                response_data = json.loads(chunk)
+                content = self._stream_delta_content(response_data)
+                if content is not None:
+                    yield content
 
     async def aio_batch_predict(
         self,

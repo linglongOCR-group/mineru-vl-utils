@@ -1,7 +1,7 @@
 import asyncio
 import math
 from dataclasses import dataclass
-from typing import Literal, Sequence, TypeAlias
+from typing import AsyncIterable, Literal, Sequence, TypeAlias
 
 from PIL import Image
 
@@ -158,6 +158,15 @@ class VlmClient:
         sampling_params: SamplingParams | None = None,
         priority: int | None = None,
     ) -> str:
+        raise NotImplementedError()
+
+    async def async_stream_predict(
+        self,
+        image: ImageType,
+        prompt: str = "",
+        sampling_params: SamplingParams | None = None,
+        priority: int | None = None,
+    ) -> AsyncIterable[str]:
         raise NotImplementedError()
 
     async def aio_batch_predict(

@@ -872,6 +872,67 @@ class MinerUClient:
         )
         return output
 
+    def _stream_predict_with_dissection(
+        self,
+        image: ImageType,
+        prompt: str,
+        params: SamplingParams | None,
+        priority: int | None,
+        scored: bool | None,
+        bbox_id: str,
+        recorder: DissectionRecorder,
+    ) -> _PredictResult | None:
+        if self._resolve_scored(scored):
+            return self._predict_with_dissection(image, prompt, params, priority, scored, bbox_id, recorder)
+        start = time.monotonic()
+        recorder.record_recognition_requested(
+            bbox_id,
+            prompt=prompt,
+            endpoint=self._client_endpoint(self.client),
+            model_name=self._client_model_name(self.client),
+        )
+        chunks: list[str] = []
+        try:
+            for chunk in self.client.stream_predict(image, prompt, params, priority):
+                chunks.append(chunk)
+        except Exception as exc:
+            self._record_stream_exception(recorder, bbox_id, exc, chunks)
+            return None
+        output_text = "".join(chunks)
+        recorder.record_recognized(
+            bbox_id,
+            output_text,
+            duration_seconds=time.monotonic() - start,
+        )
+        return _PredictResult(output_text)
+
+    def _record_stream_exception(
+        self,
+        recorder: DissectionRecorder,
+        bbox_id: str,
+        error: Exception,
+        chunks: Sequence[str],
+    ) -> None:
+        partial_content = "".join(chunks)
+        retry_count = getattr(self.client, "max_retries", None)
+        retry_backoff_factor = getattr(self.client, "retry_backoff_factor", None)
+        if partial_content:
+            recorder.record_partial(
+                bbox_id,
+                partial_content=partial_content,
+                error=error,
+                retry_count=retry_count,
+                retry_backoff_factor=retry_backoff_factor,
+            )
+        else:
+            recorder.record_failed(
+                bbox_id,
+                stage="recognition",
+                error=error,
+                retry_count=retry_count,
+                retry_backoff_factor=retry_backoff_factor,
+            )
+
     async def _aio_predict_with_dissection(
         self,
         image: ImageType,
@@ -882,7 +943,18 @@ class MinerUClient:
         scored: bool | None,
         bbox_id: str,
         recorder: DissectionRecorder,
+        dissection_stream: bool = False,
     ) -> _PredictResult | None:
+        if dissection_stream and not self._resolve_scored(scored):
+            return await self._aio_stream_predict_with_dissection(
+                image,
+                prompt,
+                params,
+                priority,
+                semaphore,
+                bbox_id,
+                recorder,
+            )
         start = time.monotonic()
         recorder.record_recognition_requested(
             bbox_id,
@@ -907,6 +979,39 @@ class MinerUClient:
             duration_seconds=time.monotonic() - start,
         )
         return output
+
+    async def _aio_stream_predict_with_dissection(
+        self,
+        image: ImageType,
+        prompt: str,
+        params: SamplingParams | None,
+        priority: int | None,
+        semaphore: asyncio.Semaphore | None,
+        bbox_id: str,
+        recorder: DissectionRecorder,
+    ) -> _PredictResult | None:
+        start = time.monotonic()
+        recorder.record_recognition_requested(
+            bbox_id,
+            prompt=prompt,
+            endpoint=self._client_endpoint(self.client),
+            model_name=self._client_model_name(self.client),
+        )
+        chunks: list[str] = []
+        try:
+            async with semaphore if semaphore is not None else nullcontext():
+                async for chunk in self.client.async_stream_predict(image, prompt, params, priority):
+                    chunks.append(chunk)
+        except Exception as exc:
+            self._record_stream_exception(recorder, bbox_id, exc, chunks)
+            return None
+        output_text = "".join(chunks)
+        recorder.record_recognized(
+            bbox_id,
+            output_text,
+            duration_seconds=time.monotonic() - start,
+        )
+        return _PredictResult(output_text)
 
     @staticmethod
     def _flatten_prepared_inputs(
@@ -1118,6 +1223,7 @@ class MinerUClient:
         scored: bool | None = None,
         image_analysis: bool | None = None,
         dissection_recorder: DissectionRecorder | None = None,
+        dissection_stream: bool = False,
         page_idx: int = 0,
     ) -> ExtractResult:
         try:
@@ -1148,15 +1254,26 @@ class MinerUClient:
                 bbox_id = bbox_ids.get(idx)
                 if not bbox_id:
                     continue
-                output = self._predict_with_dissection(
-                    block_image,
-                    prompt,
-                    param,
-                    priority,
-                    scored,
-                    bbox_id,
-                    dissection_recorder,
-                )
+                if dissection_stream:
+                    output = self._stream_predict_with_dissection(
+                        block_image,
+                        prompt,
+                        param,
+                        priority,
+                        scored,
+                        bbox_id,
+                        dissection_recorder,
+                    )
+                else:
+                    output = self._predict_with_dissection(
+                        block_image,
+                        prompt,
+                        param,
+                        priority,
+                        scored,
+                        bbox_id,
+                        dissection_recorder,
+                    )
                 if output is None:
                     continue
                 layout_result[idx].content = output.text
@@ -1172,6 +1289,7 @@ class MinerUClient:
         scored: bool | None = None,
         image_analysis: bool | None = None,
         dissection_recorder: DissectionRecorder | None = None,
+        dissection_stream: bool = False,
         page_idx: int = 0,
     ) -> ExtractResult:
         semaphore = semaphore or asyncio.Semaphore(self.max_concurrency)
@@ -1216,6 +1334,7 @@ class MinerUClient:
                         scored,
                         bbox_id,
                         dissection_recorder,
+                        dissection_stream,
                     )
                 )
                 task_indices.append(idx)
@@ -1236,6 +1355,7 @@ class MinerUClient:
         scored: bool | None = None,
         image_analysis: bool | None = None,
         dissection_recorder: DissectionRecorder | None = None,
+        dissection_stream: bool = False,
         page_start_index: int = 0,
     ) -> list[ExtractResult]:
         try:
@@ -1250,6 +1370,7 @@ class MinerUClient:
             scored=scored,
             image_analysis=image_analysis,
             dissection_recorder=dissection_recorder,
+            dissection_stream=dissection_stream,
             page_start_index=page_start_index,
         )
 
@@ -1267,6 +1388,7 @@ class MinerUClient:
         scored: bool | None = None,
         image_analysis: bool | None = None,
         dissection_recorder: DissectionRecorder | None = None,
+        dissection_stream: bool = False,
         page_start_index: int = 0,
     ) -> list[ExtractResult]:
         if priority is None and self.incremental_priority:
@@ -1284,6 +1406,7 @@ class MinerUClient:
                     scored=scored,
                     image_analysis=image_analysis,
                     dissection_recorder=dissection_recorder,
+                    dissection_stream=dissection_stream,
                     page_idx=page_start_index + img_idx,
                 )
                 for img_idx, (image, page_priority) in enumerate(zip(images, priority))
@@ -1416,6 +1539,7 @@ class MinerUClient:
         scored: bool | None = None,
         image_analysis: bool | None = None,
         dissection_recorder: DissectionRecorder | None = None,
+        dissection_stream: bool = False,
         page_start_index: int = 0,
     ) -> list[ExtractResult]:
         if self.batching_mode == "concurrent":
@@ -1426,6 +1550,7 @@ class MinerUClient:
                 scored,
                 image_analysis,
                 dissection_recorder,
+                dissection_stream,
                 page_start_index,
             )
         else:  # self.batching_mode == "stepping"
@@ -1446,6 +1571,7 @@ class MinerUClient:
         scored: bool | None = None,
         image_analysis: bool | None = None,
         dissection_recorder: DissectionRecorder | None = None,
+        dissection_stream: bool = False,
         page_start_index: int = 0,
     ) -> list[ExtractResult]:
         semaphore = semaphore or asyncio.Semaphore(self.max_concurrency)
@@ -1458,6 +1584,7 @@ class MinerUClient:
                 scored,
                 image_analysis,
                 dissection_recorder,
+                dissection_stream,
                 page_start_index,
             )
         else:  # self.batching_mode == "stepping"
