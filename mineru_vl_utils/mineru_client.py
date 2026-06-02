@@ -1611,36 +1611,18 @@ class MinerUClient:
         scored: bool | None = None,
         image_analysis: bool | None = None,
     ) -> list[ExtractResult]:
-        if priority is None and self.incremental_priority:
-            priority = list(range(len(images)))
         layout_results = self.batch_layout_detect(images, priority, scored)
-        prepared_inputs = self.helper.batch_prepare_for_extract(
-            self.executor,
-            images,
-            layout_results,
-            not_extract_list,
-            image_analysis,
-        )
-        all_images, all_prompts, all_params, all_indices = self._flatten_prepared_inputs(prepared_inputs)
-        outputs = self._batch_predict(all_images, all_prompts, all_params, priority, scored)
-        for (img_idx, idx), output in zip(all_indices, outputs):
-            layout_results[img_idx][idx].content = output.text
-            layout_results[img_idx][idx].scored = output.scored
-        processed_list = self.helper.batch_post_process(self.executor, layout_results)
-        results = [ExtractResult(blocks, layout.layout_scored) for layout, blocks in zip(layout_results, processed_list)]
-
-        if self.helper.enable_cross_page_table_merge:
-            from .post_process.cross_page_table import detect_cross_page_cell_merge
-
-            params = self.sampling_params.get("[cross_page_table_merge]")
-
-            def batch_predict_fn(prompts: list[str]) -> list[str]:
-                return self.client.batch_predict(
-                    [None] * len(prompts), prompts, [params] * len(prompts),
-                )
-
-            detect_cross_page_cell_merge(results, batch_predict_fn)
-
+        results = [
+            self.recognize_from_layout(
+                image, layout_result,
+                priority=priority,
+                not_extract_list=not_extract_list,
+                scored=scored,
+                image_analysis=image_analysis,
+                page_idx=idx,
+            )
+            for idx, (image, layout_result) in enumerate(zip(images, layout_results))
+        ]
         return results
 
     async def aio_stepping_two_step_extract(
@@ -1652,58 +1634,17 @@ class MinerUClient:
         scored: bool | None = None,
         image_analysis: bool | None = None,
     ) -> list[ExtractResult]:
-        if priority is None and self.incremental_priority:
-            priority = list(range(len(images)))
         semaphore = semaphore or asyncio.Semaphore(self.max_concurrency)
         layout_results = await self.aio_batch_layout_detect(images, priority, semaphore, scored)
-        prepared_inputs = await gather_tasks(
-            tasks=[
-                self.helper.aio_prepare_for_extract(
-                    self.executor,
-                    image,
-                    layout_result,
-                    not_extract_list,
-                    image_analysis,
-                )
-                for image, layout_result in zip(images, layout_results)
-            ],
-            use_tqdm=self.use_tqdm,
-            tqdm_desc="Extract Preparation",
+        return await self.aio_batch_recognize_from_layout(
+            images, layout_results,
+            priority=priority,
+            semaphore=semaphore,
+            not_extract_list=not_extract_list,
+            scored=scored,
+            image_analysis=image_analysis,
+            page_start_index=0,
         )
-        all_images, all_prompts, all_params, all_indices = self._flatten_prepared_inputs(prepared_inputs)
-        outputs = await self._aio_batch_predict(
-            all_images,
-            all_prompts,
-            all_params,
-            priority,
-            semaphore,
-            scored,
-            use_tqdm=self.use_tqdm,
-            tqdm_desc="Extraction",
-        )
-        for (img_idx, idx), output in zip(all_indices, outputs):
-            layout_results[img_idx][idx].content = output.text
-            layout_results[img_idx][idx].scored = output.scored
-        processed_list = await gather_tasks(
-            tasks=[self.helper.aio_post_process(self.executor, lr) for lr in layout_results],
-            use_tqdm=self.use_tqdm,
-            tqdm_desc="Post Processing",
-        )
-        results = [ExtractResult(blocks, layout.layout_scored) for layout, blocks in zip(layout_results, processed_list)]
-
-        if self.helper.enable_cross_page_table_merge:
-            from .post_process.cross_page_table import aio_detect_cross_page_cell_merge
-
-            params = self.sampling_params.get("[cross_page_table_merge]")
-
-            async def aio_batch_predict_fn(prompts: list[str]) -> list[str]:
-                return await self.client.aio_batch_predict(
-                    [None] * len(prompts), prompts, [params] * len(prompts),
-                )
-
-            await aio_detect_cross_page_cell_merge(results, aio_batch_predict_fn)
-
-        return results
 
     def batch_two_step_extract(
         self,
