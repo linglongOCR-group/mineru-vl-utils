@@ -1589,19 +1589,39 @@ class MinerUClient:
             tqdm_desc="Two Step Extraction",
         )
 
-        if self.helper.enable_cross_page_table_merge:
-            from .post_process.cross_page_table import aio_detect_cross_page_cell_merge
-
-            params = self.sampling_params.get("[cross_page_table_merge]")
-
-            async def aio_batch_predict_fn(prompts: list[str]) -> list[str]:
-                return await self.client.aio_batch_predict(
-                    [None] * len(prompts), prompts, [params] * len(prompts),
-                )
-
-            await aio_detect_cross_page_cell_merge(results, aio_batch_predict_fn)
+        await self._aio_apply_cross_page_table_merge(results)
 
         return results
+
+    async def _aio_apply_cross_page_table_merge(self, results: list[ExtractResult]) -> None:
+        if not self.helper.enable_cross_page_table_merge:
+            return
+
+        from .post_process.cross_page_table import aio_detect_cross_page_cell_merge
+
+        params = self.sampling_params.get("[cross_page_table_merge]")
+
+        async def aio_batch_predict_fn(prompts: list[str]) -> list[str]:
+            return await self.client.aio_batch_predict(
+                [None] * len(prompts), prompts, [params] * len(prompts),
+            )
+
+        await aio_detect_cross_page_cell_merge(results, aio_batch_predict_fn)
+
+    def _apply_cross_page_table_merge(self, results: list[ExtractResult]) -> None:
+        if not self.helper.enable_cross_page_table_merge:
+            return
+
+        from .post_process.cross_page_table import detect_cross_page_cell_merge
+
+        params = self.sampling_params.get("[cross_page_table_merge]")
+
+        def batch_predict_fn(prompts: list[str]) -> list[str]:
+            return self.client.batch_predict(
+                [None] * len(prompts), prompts, [params] * len(prompts),
+            )
+
+        detect_cross_page_cell_merge(results, batch_predict_fn)
 
     def stepping_two_step_extract(
         self,
@@ -1623,6 +1643,7 @@ class MinerUClient:
             )
             for idx, (image, layout_result) in enumerate(zip(images, layout_results))
         ]
+        self._apply_cross_page_table_merge(results)
         return results
 
     async def aio_stepping_two_step_extract(
@@ -1636,7 +1657,7 @@ class MinerUClient:
     ) -> list[ExtractResult]:
         semaphore = semaphore or asyncio.Semaphore(self.max_concurrency)
         layout_results = await self.aio_batch_layout_detect(images, priority, semaphore, scored)
-        return await self.aio_batch_recognize_from_layout(
+        results = await self.aio_batch_recognize_from_layout(
             images, layout_results,
             priority=priority,
             semaphore=semaphore,
@@ -1645,6 +1666,8 @@ class MinerUClient:
             image_analysis=image_analysis,
             page_start_index=0,
         )
+        await self._aio_apply_cross_page_table_merge(results)
+        return results
 
     def batch_two_step_extract(
         self,

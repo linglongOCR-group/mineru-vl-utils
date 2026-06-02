@@ -17,6 +17,12 @@ class FakeLayoutClient:
     def predict(self, image, prompt, sampling_params=None, priority=None):
         return "layout-output"
 
+    def batch_predict(self, images, prompts, params=None, priority=None):
+        return ["layout-output"] * len(images)
+
+    async def aio_batch_predict(self, images, prompts, params=None, priority=None, *, semaphore=None, use_tqdm=False, tqdm_desc=None):
+        return ["layout-output"] * len(images)
+
 
 class FakeRecognitionClient:
     server_url = "http://recognition"
@@ -211,3 +217,49 @@ def test_batch_recognize_from_layout_processes_all_images(monkeypatch):
         assert len(result) == 2
         assert result[0].content is not None
         assert result[1].content is not None
+
+
+def test_stepping_two_step_extract_runs_cross_page_table_merge(monkeypatch):
+    client = _make_client(monkeypatch)
+    _install_sync_fakes(client)
+    client.batching_mode = "stepping"
+    client.helper.enable_cross_page_table_merge = True
+    image = Image.new("RGB", (20, 10), (255, 255, 255))
+
+    calls = []
+
+    def fake_detect_cross_page_cell_merge(results, batch_predict_fn):
+        calls.append(len(results))
+
+    monkeypatch.setattr(
+        "mineru_vl_utils.post_process.cross_page_table.detect_cross_page_cell_merge",
+        fake_detect_cross_page_cell_merge,
+    )
+
+    results = client.batch_two_step_extract([image, image])
+
+    assert len(results) == 2
+    assert calls == [2]
+
+
+def test_aio_stepping_two_step_extract_runs_cross_page_table_merge(monkeypatch):
+    client = _make_client(monkeypatch)
+    _install_async_fakes(client)
+    client.batching_mode = "stepping"
+    client.helper.enable_cross_page_table_merge = True
+    image = Image.new("RGB", (20, 10), (255, 255, 255))
+
+    calls = []
+
+    async def fake_aio_detect_cross_page_cell_merge(results, aio_batch_predict_fn):
+        calls.append(len(results))
+
+    monkeypatch.setattr(
+        "mineru_vl_utils.post_process.cross_page_table.aio_detect_cross_page_cell_merge",
+        fake_aio_detect_cross_page_cell_merge,
+    )
+
+    results = asyncio.run(client.aio_batch_two_step_extract([image, image]))
+
+    assert len(results) == 2
+    assert calls == [2]
