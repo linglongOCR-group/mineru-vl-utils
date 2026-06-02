@@ -1126,6 +1126,223 @@ class MinerUClient:
         content = blocks[0].content if blocks else None
         return ExtractStr(content, scored=output.scored) if content is not None else None
 
+    def recognize_from_layout(
+        self,
+        image: Image.Image,
+        layout_blocks: ExtractResult | Sequence[ContentBlock],
+        priority: int | None = None,
+        not_extract_list: list[str] | None = None,
+        scored: bool | None = None,
+        image_analysis: bool | None = None,
+        dissection_recorder: DissectionRecorder | None = None,
+        dissection_stream: bool = False,
+        page_idx: int = 0,
+    ) -> ExtractResult:
+        if not isinstance(layout_blocks, ExtractResult):
+            layout_blocks = ExtractResult(layout_blocks)
+        if dissection_recorder is not None:
+            dissection_recorder.record_stage_started("crop_generation")
+        try:
+            bbox_ids = self._record_dissection_layout(dissection_recorder, page_idx, image, layout_blocks)
+            block_images, prompts, params, indices = self.helper.prepare_for_extract(
+                image,
+                layout_blocks,
+                not_extract_list,
+                image_analysis,
+            )
+            self._record_dissection_prepared_crops(dissection_recorder, bbox_ids, block_images, indices)
+        except Exception as exc:
+            if dissection_recorder is not None:
+                dissection_recorder.record_stage_finished("crop_generation", "failed", exc)
+            raise
+        if dissection_recorder is not None:
+            dissection_recorder.record_stage_finished("crop_generation", "completed")
+            dissection_recorder.record_stage_started("crop_recognition")
+        if dissection_recorder is None:
+            outputs = self._batch_predict(block_images, prompts, params, priority, scored)
+            for idx, output in zip(indices, outputs):
+                layout_blocks[idx].content = output.text
+                layout_blocks[idx].scored = output.scored
+        else:
+            for block_image, prompt, param, idx in zip(block_images, prompts, params, indices):
+                bbox_id = bbox_ids.get(idx)
+                if not bbox_id:
+                    continue
+                if dissection_stream:
+                    output = self._stream_predict_with_dissection(
+                        block_image,
+                        prompt,
+                        param,
+                        priority,
+                        scored,
+                        bbox_id,
+                        dissection_recorder,
+                    )
+                else:
+                    output = self._predict_with_dissection(
+                        block_image,
+                        prompt,
+                        param,
+                        priority,
+                        scored,
+                        bbox_id,
+                        dissection_recorder,
+                    )
+                if output is None:
+                    continue
+                layout_blocks[idx].content = output.text
+                layout_blocks[idx].scored = output.scored
+        if dissection_recorder is not None:
+            dissection_recorder.record_stage_finished("crop_recognition", "completed")
+            dissection_recorder.record_stage_started("post_processing")
+        try:
+            processed = self.helper.post_process(layout_blocks)
+        except Exception as exc:
+            if dissection_recorder is not None:
+                dissection_recorder.record_stage_finished("post_processing", "failed", exc)
+            raise
+        if dissection_recorder is not None:
+            dissection_recorder.record_stage_finished("post_processing", "completed")
+        return ExtractResult(processed, layout_blocks.layout_scored)
+
+    async def aio_recognize_from_layout(
+        self,
+        image: Image.Image,
+        layout_blocks: ExtractResult | Sequence[ContentBlock],
+        priority: int | None = None,
+        semaphore: asyncio.Semaphore | None = None,
+        not_extract_list: list[str] | None = None,
+        scored: bool | None = None,
+        image_analysis: bool | None = None,
+        dissection_recorder: DissectionRecorder | None = None,
+        dissection_stream: bool = False,
+        page_idx: int = 0,
+    ) -> ExtractResult:
+        if not isinstance(layout_blocks, ExtractResult):
+            layout_blocks = ExtractResult(layout_blocks)
+        if dissection_recorder is not None:
+            dissection_recorder.record_stage_started("crop_generation")
+        try:
+            bbox_ids = self._record_dissection_layout(dissection_recorder, page_idx, image, layout_blocks)
+            block_images, prompts, params, indices = await self.helper.aio_prepare_for_extract(
+                self.executor,
+                image,
+                layout_blocks,
+                not_extract_list,
+                image_analysis,
+            )
+            self._record_dissection_prepared_crops(dissection_recorder, bbox_ids, block_images, indices)
+        except Exception as exc:
+            if dissection_recorder is not None:
+                dissection_recorder.record_stage_finished("crop_generation", "failed", exc)
+            raise
+        if dissection_recorder is not None:
+            dissection_recorder.record_stage_finished("crop_generation", "completed")
+            dissection_recorder.record_stage_started("crop_recognition")
+        if dissection_recorder is None:
+            outputs = await self._aio_batch_predict(block_images, prompts, params, priority, semaphore, scored)
+            for idx, output in zip(indices, outputs):
+                layout_blocks[idx].content = output.text
+                layout_blocks[idx].scored = output.scored
+        else:
+            tasks = []
+            task_indices = []
+            for block_image, prompt, param, idx in zip(block_images, prompts, params, indices):
+                bbox_id = bbox_ids.get(idx)
+                if not bbox_id:
+                    continue
+                tasks.append(
+                    self._aio_predict_with_dissection(
+                        block_image,
+                        prompt,
+                        param,
+                        priority,
+                        semaphore,
+                        scored,
+                        bbox_id,
+                        dissection_recorder,
+                        dissection_stream,
+                    )
+                )
+                task_indices.append(idx)
+            outputs = await gather_tasks(tasks=tasks, use_tqdm=False)
+            for idx, output in zip(task_indices, outputs):
+                if output is None:
+                    continue
+                layout_blocks[idx].content = output.text
+                layout_blocks[idx].scored = output.scored
+        if dissection_recorder is not None:
+            dissection_recorder.record_stage_finished("crop_recognition", "completed")
+            dissection_recorder.record_stage_started("post_processing")
+        try:
+            processed = await self.helper.aio_post_process(self.executor, layout_blocks)
+        except Exception as exc:
+            if dissection_recorder is not None:
+                dissection_recorder.record_stage_finished("post_processing", "failed", exc)
+            raise
+        if dissection_recorder is not None:
+            dissection_recorder.record_stage_finished("post_processing", "completed")
+        return ExtractResult(processed, layout_blocks.layout_scored)
+
+    def batch_recognize_from_layout(
+        self,
+        images: list[Image.Image],
+        layout_results: Sequence[ExtractResult | Sequence[ContentBlock]],
+        priority: int | None = None,
+        not_extract_list: list[str] | None = None,
+        scored: bool | None = None,
+        image_analysis: bool | None = None,
+        dissection_recorder: DissectionRecorder | None = None,
+        dissection_stream: bool = False,
+        page_start_index: int = 0,
+    ) -> list[ExtractResult]:
+        results = []
+        for img_idx, (image, layout) in enumerate(zip(images, layout_results)):
+            result = self.recognize_from_layout(
+                image,
+                layout,
+                priority=priority,
+                not_extract_list=not_extract_list,
+                scored=scored,
+                image_analysis=image_analysis,
+                dissection_recorder=dissection_recorder,
+                dissection_stream=dissection_stream,
+                page_idx=page_start_index + img_idx,
+            )
+            results.append(result)
+        return results
+
+    async def aio_batch_recognize_from_layout(
+        self,
+        images: list[Image.Image],
+        layout_results: Sequence[ExtractResult | Sequence[ContentBlock]],
+        priority: int | None = None,
+        semaphore: asyncio.Semaphore | None = None,
+        not_extract_list: list[str] | None = None,
+        scored: bool | None = None,
+        image_analysis: bool | None = None,
+        dissection_recorder: DissectionRecorder | None = None,
+        dissection_stream: bool = False,
+        page_start_index: int = 0,
+    ) -> list[ExtractResult]:
+        semaphore = semaphore or asyncio.Semaphore(self.max_concurrency)
+        tasks = [
+            self.aio_recognize_from_layout(
+                image,
+                layout,
+                priority=priority,
+                semaphore=semaphore,
+                not_extract_list=not_extract_list,
+                scored=scored,
+                image_analysis=image_analysis,
+                dissection_recorder=dissection_recorder,
+                dissection_stream=dissection_stream,
+                page_idx=page_start_index + img_idx,
+            )
+            for img_idx, (image, layout) in enumerate(zip(images, layout_results))
+        ]
+        return await gather_tasks(tasks=tasks, use_tqdm=self.use_tqdm, tqdm_desc="Recognize From Layout")
+
     def batch_content_extract(
         self,
         images: list[Image.Image],
@@ -1243,72 +1460,20 @@ class MinerUClient:
             raise
         if dissection_recorder is not None:
             dissection_recorder.record_stage_finished("layout_detection", "completed")
-            dissection_recorder.record_stage_started("crop_generation")
-        try:
-            bbox_ids = self._record_dissection_layout(dissection_recorder, page_idx, image, layout_result)
-            block_images, prompts, params, indices = self.helper.prepare_for_extract(
-                image,
-                layout_result,
-                not_extract_list,
-                image_analysis,
-            )
-            self._record_dissection_prepared_crops(dissection_recorder, bbox_ids, block_images, indices)
-        except Exception as exc:
-            if dissection_recorder is not None:
-                dissection_recorder.record_stage_finished("crop_generation", "failed", exc)
-                dissection_recorder.record_pipeline_finished("failed", exc)
-            raise
+        result = self.recognize_from_layout(
+            image,
+            layout_result,
+            priority=priority,
+            not_extract_list=not_extract_list,
+            scored=scored,
+            image_analysis=image_analysis,
+            dissection_recorder=dissection_recorder,
+            dissection_stream=dissection_stream,
+            page_idx=page_idx,
+        )
         if dissection_recorder is not None:
-            dissection_recorder.record_stage_finished("crop_generation", "completed")
-            dissection_recorder.record_stage_started("crop_recognition")
-        if dissection_recorder is None:
-            outputs = self._batch_predict(block_images, prompts, params, priority, scored)
-            for idx, output in zip(indices, outputs):
-                layout_result[idx].content = output.text
-                layout_result[idx].scored = output.scored
-        else:
-            for block_image, prompt, param, idx in zip(block_images, prompts, params, indices):
-                bbox_id = bbox_ids.get(idx)
-                if not bbox_id:
-                    continue
-                if dissection_stream:
-                    output = self._stream_predict_with_dissection(
-                        block_image,
-                        prompt,
-                        param,
-                        priority,
-                        scored,
-                        bbox_id,
-                        dissection_recorder,
-                    )
-                else:
-                    output = self._predict_with_dissection(
-                        block_image,
-                        prompt,
-                        param,
-                        priority,
-                        scored,
-                        bbox_id,
-                        dissection_recorder,
-                    )
-                if output is None:
-                    continue
-                layout_result[idx].content = output.text
-                layout_result[idx].scored = output.scored
-        if dissection_recorder is not None:
-            dissection_recorder.record_stage_finished("crop_recognition", "completed")
-            dissection_recorder.record_stage_started("post_processing")
-        try:
-            processed = self.helper.post_process(layout_result)
-        except Exception as exc:
-            if dissection_recorder is not None:
-                dissection_recorder.record_stage_finished("post_processing", "failed", exc)
-                dissection_recorder.record_pipeline_finished("failed", exc)
-            raise
-        if dissection_recorder is not None:
-            dissection_recorder.record_stage_finished("post_processing", "completed")
             dissection_recorder.record_pipeline_finished("completed")
-        return ExtractResult(processed, layout_result.layout_scored)
+        return result
 
     async def aio_two_step_extract(
         self,
@@ -1340,71 +1505,21 @@ class MinerUClient:
             raise
         if dissection_recorder is not None:
             dissection_recorder.record_stage_finished("layout_detection", "completed")
-            dissection_recorder.record_stage_started("crop_generation")
-        try:
-            bbox_ids = self._record_dissection_layout(dissection_recorder, page_idx, image, layout_result)
-            block_images, prompts, params, indices = await self.helper.aio_prepare_for_extract(
-                self.executor,
-                image,
-                layout_result,
-                not_extract_list,
-                image_analysis,
-            )
-            self._record_dissection_prepared_crops(dissection_recorder, bbox_ids, block_images, indices)
-        except Exception as exc:
-            if dissection_recorder is not None:
-                dissection_recorder.record_stage_finished("crop_generation", "failed", exc)
-                dissection_recorder.record_pipeline_finished("failed", exc)
-            raise
+        result = await self.aio_recognize_from_layout(
+            image,
+            layout_result,
+            priority=priority,
+            semaphore=semaphore,
+            not_extract_list=not_extract_list,
+            scored=scored,
+            image_analysis=image_analysis,
+            dissection_recorder=dissection_recorder,
+            dissection_stream=dissection_stream,
+            page_idx=page_idx,
+        )
         if dissection_recorder is not None:
-            dissection_recorder.record_stage_finished("crop_generation", "completed")
-            dissection_recorder.record_stage_started("crop_recognition")
-        if dissection_recorder is None:
-            outputs = await self._aio_batch_predict(block_images, prompts, params, priority, semaphore, scored)
-            for idx, output in zip(indices, outputs):
-                layout_result[idx].content = output.text
-                layout_result[idx].scored = output.scored
-        else:
-            tasks = []
-            task_indices = []
-            for block_image, prompt, param, idx in zip(block_images, prompts, params, indices):
-                bbox_id = bbox_ids.get(idx)
-                if not bbox_id:
-                    continue
-                tasks.append(
-                    self._aio_predict_with_dissection(
-                        block_image,
-                        prompt,
-                        param,
-                        priority,
-                        semaphore,
-                        scored,
-                        bbox_id,
-                        dissection_recorder,
-                        dissection_stream,
-                    )
-                )
-                task_indices.append(idx)
-            outputs = await gather_tasks(tasks=tasks, use_tqdm=False)
-            for idx, output in zip(task_indices, outputs):
-                if output is None:
-                    continue
-                layout_result[idx].content = output.text
-                layout_result[idx].scored = output.scored
-        if dissection_recorder is not None:
-            dissection_recorder.record_stage_finished("crop_recognition", "completed")
-            dissection_recorder.record_stage_started("post_processing")
-        try:
-            processed = await self.helper.aio_post_process(self.executor, layout_result)
-        except Exception as exc:
-            if dissection_recorder is not None:
-                dissection_recorder.record_stage_finished("post_processing", "failed", exc)
-                dissection_recorder.record_pipeline_finished("failed", exc)
-            raise
-        if dissection_recorder is not None:
-            dissection_recorder.record_stage_finished("post_processing", "completed")
             dissection_recorder.record_pipeline_finished("completed")
-        return ExtractResult(processed, layout_result.layout_scored)
+        return result
 
     def concurrent_two_step_extract(
         self,
